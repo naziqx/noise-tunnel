@@ -1,0 +1,18 @@
+[package]
+name = "noise-tunnel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytes = "1"
+rand = "0.8"
+hex = "0.4"
+snow = "0.9"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+futures-util = "0.3"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tun = { version = "0.6", features = ["async"] }
+native-tls = "0.2"
+tokio-native-tls = "0.3"
