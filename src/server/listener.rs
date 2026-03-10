@@ -166,7 +166,7 @@ async fn handle_client(
         }
     });
 
-    println!("[сервер] 🚀 Туннель активен!");
+    println!("[сервер] Туннель активен!");
 
     tokio::select! {
         _ = tun_to_ws => println!("[сервер] TUN→WS завершена"),

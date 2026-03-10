@@ -14,7 +14,7 @@ pub async fn run(
     my_keys:           Keypair,
     server_public_key: Vec<u8>,
 ) -> anyhow::Result<()> {
-    println!("[клиент] подключаюсь к {}...", server_url);
+    println!("[Client] Connect to {}...", server_url);
 
     let connector = Connector::NativeTls(native_tls::TlsConnector::new()?);
     let (ws, _) = tokio_tungstenite::connect_async_tls_with_config(
@@ -25,29 +25,29 @@ pub async fn run(
     ).await?;
     let (mut ws_tx, mut ws_rx) = ws.split();
 
-    println!("[клиент] WebSocket установлен, начинаю handshake...");
+    println!("[Client] WebSocket installed, starting handshake...");
 
     // ── Noise XX handshake ──────────────────────────────────────
     let mut hs = Handshake::initiate(&my_keys.private, &server_public_key)?;
 
     let msg1 = hs.write_message(&[])?;
     ws_tx.send(Message::Binary(msg1.into())).await?;
-    println!("[клиент] → msg1 отправлен");
+    println!("[Client] → msg1 send");
 
     let msg2 = ws_rx.next().await
-        .ok_or(anyhow::anyhow!("соединение закрыто"))??;
+        .ok_or(anyhow::anyhow!("connection close"))??;
     hs.read_message(&msg2.into_data())?;
-    println!("[клиент] ← msg2 получен");
+    println!("[Client] ← msg2 received");
 
     let msg3 = hs.write_message(&[])?;
     ws_tx.send(Message::Binary(msg3.into())).await?;
-    println!("[клиент] → msg3 отправлен");
+    println!("[Client] → msg3 send");
 
-    println!("[клиент] ✓ Handshake завершён!");
+    println!("[Client] ✓ Handshake completed!");
 
     let session = hs.into_transport()?;
 
-    // Оборачиваем сессию в Arc<Mutex> — будем использовать из двух задач
+    // Оборачиваем сессию в Arc<Mutex> — использовать из двух задач
     let session = std::sync::Arc::new(tokio::sync::Mutex::new(session));
 
     // ── Создаём TUN интерфейс ───────────────────────────────────
@@ -63,7 +63,7 @@ pub async fn run(
     let session_clone = session.clone();
     let ws_tx_clone   = ws_tx.clone();
 
-    // ── Задача 1: TUN → WebSocket ───────────────────────────────
+    // ──  TUN → WebSocket ───────────────────────────────
     // Читаем IP пакеты с TUN и шлём на сервер
     let tun_to_ws = tokio::spawn(async move {
         let mut buf = vec![0u8; 2048];
@@ -93,7 +93,7 @@ pub async fn run(
         }
     });
 
-    // ── Задача 2: WebSocket → TUN ───────────────────────────────
+    // ── WebSocket → TUN ───────────────────────────────
     // Получаем пакеты от сервера и пишем в TUN
     let ws_to_tun = tokio::spawn(async move {
         while let Some(msg) = ws_rx.next().await {
@@ -125,12 +125,12 @@ pub async fn run(
         }
     });
 
-    println!("[клиент]  Туннель запущен! Трафик идёт через TUN");
+    println!("[Client]  Tuunel start! Traffic goes through TUN");
 
     // Ждём завершения любой из задач
     tokio::select! {
-        _ = tun_to_ws => println!("[клиент] TUN→WS задача завершена"),
-        _ = ws_to_tun => println!("[клиент] WS→TUN задача завершена"),
+        _ = tun_to_ws => println!("[Client] TUN→WS  completed"),
+        _ = ws_to_tun => println!("[Client] WS→TUN  completed"),
     }
 
     Ok(())
