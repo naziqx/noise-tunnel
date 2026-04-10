@@ -12,7 +12,7 @@ use native_tls::{Identity, TlsAcceptor};
 use std::fs;
 
 pub async fn run(addr: &str, server_keys: Keypair) -> anyhow::Result<()> {
-    // Загружаем TLS сертификат
+    // TLS сертификат
     let cert = fs::read("/etc/letsencrypt/live/noise-tunnel.ddns.net/fullchain.pem")?;
     let key  = fs::read("/etc/letsencrypt/live/noise-tunnel.ddns.net/privkey.pem")?;
 
