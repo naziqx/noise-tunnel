@@ -1,18 +1,22 @@
-use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::protocol::noise::{Handshake, Keypair, NoiseSession};
+use crate::protocol::noise::{Handshake, Keypair};
 use crate::protocol::frame::{Frame, FrameType};
 
 use native_tls::{Identity, TlsAcceptor};
 use std::fs;
 
+// Максимум одновременных клиентов
+const MAX_CLIENTS: u8 = 50;
+
+// Пул свободных слотов — общий для всех потоков
+type SlotPool = Arc<Mutex<Vec<u8>>>;
+
 pub async fn run(addr: &str, server_keys: Keypair) -> anyhow::Result<()> {
-    // TLS сертификат
     let cert = fs::read("/etc/letsencrypt/live/noise-tunnel.ddns.net/fullchain.pem")?;
     let key  = fs::read("/etc/letsencrypt/live/noise-tunnel.ddns.net/privkey.pem")?;
 
@@ -25,13 +29,18 @@ pub async fn run(addr: &str, server_keys: Keypair) -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("[сервер] слушаю на {} (TLS)", addr);
+    println!("[сервер] максимум клиентов: {}", MAX_CLIENTS);
+
+    // Инициализируем пул: [0, 1, 2, ..., 49]
+    let pool: SlotPool = Arc::new(Mutex::new((0..MAX_CLIENTS).collect()));
 
     loop {
         let (stream, peer) = listener.accept().await?;
         println!("[сервер] подключился: {}", peer);
 
-        let acceptor     = acceptor.clone();
-        let private_key  = server_keys.private.clone();
+        let acceptor    = acceptor.clone();
+        let private_key = server_keys.private.clone();
+        let pool        = pool.clone();
 
         tokio::spawn(async move {
             let tls_stream = match acceptor.accept(stream).await {
@@ -44,12 +53,12 @@ pub async fn run(addr: &str, server_keys: Keypair) -> anyhow::Result<()> {
                 Err(e) => { eprintln!("[сервер] WS ошибка: {}", e); return; }
             };
 
-            if let Err(e) = handle_client(ws, private_key).await {
+            if let Err(e) = handle_client(ws, private_key, pool).await {
                 let msg = e.to_string();
                 if !msg.contains("Connection reset") {
                     println!("[сервер] ошибка: {}", msg);
                 }
-            }       
+            }
         });
     }
 }
@@ -57,64 +66,103 @@ pub async fn run(addr: &str, server_keys: Keypair) -> anyhow::Result<()> {
 async fn handle_client(
     ws: tokio_tungstenite::WebSocketStream<tokio_native_tls::TlsStream<tokio::net::TcpStream>>,
     private_key: Vec<u8>,
+    pool: SlotPool,
 ) -> anyhow::Result<()> {
     let (mut ws_tx, mut ws_rx) = ws.split();
 
-    println!("[сервер] WebSocket установлен, начинаю handshake...");
+    // ── Берём слот из пула ───────────────────────────────
+    let slot = {
+        let mut p = pool.lock().await;
+        match p.pop() {
+            Some(s) => s,
+            None => {
+                eprintln!("[сервер] нет свободных слотов, отклоняю подключение");
+                return Ok(());
+            }
+        }
+    };
 
-    // ── Noise XX handshake ──────────────────────────────────────
+    let tun_name   = format!("tun{}", slot);
+    let client_ip  = format!("172.16.0.{}", slot + 2);   // .2 - .51
+    let server_ip  = format!("172.16.1.{}", slot + 2);   // отдельная подсеть для серверной стороны
+
+    println!("[сервер] слот #{} → {} (клиент: {}, сервер: {})",
+        slot, tun_name, client_ip, server_ip);
+
+    // ── Noise XX handshake ───────────────────────────────
     let mut hs = Handshake::respond(&private_key)?;
 
     let msg1 = ws_rx.next().await
         .ok_or(anyhow::anyhow!("соединение закрыто"))??;
     hs.read_message(&msg1.into_data())?;
-    println!("[сервер] ← msg1 получен");
+    println!("[сервер] ← msg1 получен (слот #{})", slot);
 
     let msg2 = hs.write_message(&[])?;
     ws_tx.send(Message::Binary(msg2.into())).await?;
-    println!("[сервер] → msg2 отправлен");
+    println!("[сервер] → msg2 отправлен (слот #{})", slot);
 
     let msg3 = ws_rx.next().await
         .ok_or(anyhow::anyhow!("соединение закрыто"))??;
     hs.read_message(&msg3.into_data())?;
-    println!("[сервер] ← msg3 получен");
+    println!("[сервер] ← msg3 получен (слот #{})", slot);
 
-    println!("[сервер] ✓ Handshake завершён!");
+    println!("[сервер] ✓ Handshake завершён (слот #{})", slot);
 
     let session = Arc::new(Mutex::new(hs.into_transport()?));
 
-    // ── Создаём TUN на сервере ──────────────────────────────────
+    // ── Создаём TUN для этого клиента ───────────────────
     let mut tun_config = tun::Configuration::default();
     tun_config
-        .address("172.16.0.1")
-        .destination("172.16.0.2") // IP клиента в туннеле
-        .netmask("255.255.255.0")
+        .name(&tun_name)
+        .address(server_ip.as_str())
+        .destination(client_ip.as_str())
+        .netmask("255.255.255.255")  // /32 точка-точка
         .mtu(1420)
         .up();
 
     #[cfg(target_os = "linux")]
     tun_config.platform(|p| { p.packet_information(false); });
 
-    let tun_dev = tun::create_as_async(&tun_config)?;
-    println!("[сервер] ✓ TUN интерфейс создан (172.16.0.1)");
+    let tun_dev = match tun::create_as_async(&tun_config) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[сервер] ошибка создания {}: {}", tun_name, e);
+            // Возвращаем слот в пул
+            let mut p = pool.lock().await;
+            p.push(slot);
+            p.sort_unstable();
+            return Err(e.into());
+        }
+    };
+
+    println!("[сервер] ✓ {} создан ({} ↔ {})", tun_name, server_ip, client_ip);
+
+    // Маршрут до клиента
     tokio::process::Command::new("ip")
-    .args(["route", "add", "172.16.0.2", "dev", "tun0"])
-    .output()
-    .await
-    .ok();
+        .args(["route", "add", &client_ip, "dev", &tun_name])
+        .output().await.ok();
+
+    // NAT для этого клиента
+    tokio::process::Command::new("iptables")
+        .args(["-t", "nat", "-A", "POSTROUTING",
+               "-s", &client_ip, "-j", "MASQUERADE"])
+        .output().await.ok();
+
     let (mut tun_rx, mut tun_tx) = tokio::io::split(tun_dev);
-    let ws_tx = Arc::new(Mutex::new(ws_tx));
+    let ws_tx         = Arc::new(Mutex::new(ws_tx));
     let session_clone = session.clone();
     let ws_tx_clone   = ws_tx.clone();
+    let client_ip_c   = client_ip.clone();
+    let tun_name_c    = tun_name.clone();
 
-    // ── TUN → WebSocket ─────────────────────────────────────────
+    // ── TUN → WebSocket ──────────────────────────────────
     let tun_to_ws = tokio::spawn(async move {
         let mut buf = vec![0u8; 2048];
         loop {
             let n = match tun_rx.read(&mut buf).await {
                 Ok(n) if n == 0 => break,
                 Ok(n) => n,
-                Err(e) => { eprintln!("[сервер] TUN read ошибка: {}", e); break; }
+                Err(e) => { eprintln!("[{}] TUN read: {}", tun_name_c, e); break; }
             };
 
             let frame   = Frame::new_data(bytes::Bytes::copy_from_slice(&buf[..n]));
@@ -124,7 +172,7 @@ async fn handle_client(
                 let mut sess = session_clone.lock().await;
                 match sess.encrypt(&encoded) {
                     Ok(e) => e,
-                    Err(e) => { eprintln!("[сервер] encrypt ошибка: {}", e); break; }
+                    Err(e) => { eprintln!("[{}] encrypt: {}", tun_name_c, e); break; }
                 }
             };
 
@@ -135,7 +183,7 @@ async fn handle_client(
         }
     });
 
-    // ── WebSocket → TUN ─────────────────────────────────────────
+    // ── WebSocket → TUN ──────────────────────────────────
     let ws_to_tun = tokio::spawn(async move {
         while let Some(msg) = ws_rx.next().await {
             let msg = match msg {
@@ -149,7 +197,7 @@ async fn handle_client(
                 let mut sess = session.lock().await;
                 match sess.decrypt(&msg.into_data()) {
                     Ok(d) => d,
-                    Err(e) => { eprintln!("[сервер] decrypt ошибка: {}", e); break; }
+                    Err(e) => { eprintln!("[сервер] decrypt: {}", e); break; }
                 }
             };
 
@@ -166,11 +214,32 @@ async fn handle_client(
         }
     });
 
-    println!("[сервер] Туннель активен!");
+    println!("[сервер] туннель {} активен!", tun_name);
 
     tokio::select! {
-        _ = tun_to_ws => println!("[сервер] TUN→WS завершена"),
-        _ = ws_to_tun => println!("[сервер] WS→TUN завершена"),
+        _ = tun_to_ws => println!("[{}] TUN→WS завершена", tun_name),
+        _ = ws_to_tun => println!("[{}] WS→TUN завершена", tun_name),
+    }
+
+    // ── Чистка при отключении ────────────────────────────
+    println!("[сервер] слот #{} освобождается...", slot);
+
+    tokio::process::Command::new("ip")
+        .args(["route", "del", &client_ip])
+        .output().await.ok();
+
+    tokio::process::Command::new("iptables")
+        .args(["-t", "nat", "-D", "POSTROUTING",
+               "-s", &client_ip, "-j", "MASQUERADE"])
+        .output().await.ok();
+
+    // Возвращаем слот в пул
+    {
+        let mut p = pool.lock().await;
+        p.push(slot);
+        p.sort_unstable(); // меньшие номера берутся первыми
+        println!("[сервер] слот #{} возвращён в пул. Свободно: {}/{}", 
+            slot, p.len(), MAX_CLIENTS);
     }
 
     Ok(())
