@@ -1,7 +1,12 @@
 #!/bin/bash
-GATEWAY="192.168.0.1"
 VPS_IP="176.124.203.112"
 KEY_FILE="/tmp/vpn.key"
+
+# Определяем gateway и интерфейс динамически
+GATEWAY=$(ip route | grep default | awk '{print $3}' | head -1)
+IFACE=$(ip route | grep default | awk '{print $5}' | head -1)
+
+echo "Сеть: $IFACE | Gateway: $GATEWAY"
 
 # Спрашиваем ключ или берём сохранённый
 if [ -f "$KEY_FILE" ]; then
@@ -17,22 +22,33 @@ else
     read -p "Введи ключ сервера: " SERVER_KEY
 fi
 
-# Сохраняем ключ
 echo $SERVER_KEY > $KEY_FILE
+
+# Сохраняем gateway для vpn-down.sh
+echo "$GATEWAY" > /tmp/vpn.gw
+echo "$IFACE" > /tmp/vpn.iface
 
 # Запускаем туннель в фоне
 sudo ~/noise-tunnel/target/release/noise-tunnel client --server-key $SERVER_KEY &
 TUN_PID=$!
 echo $TUN_PID > /tmp/vpn.pid
 
-# Ждём пока поднимется tun0
+# Ждём пока поднимется tun0 (до 15 секунд)
 echo "Подключаюсь..."
-sleep 4
+for i in $(seq 1 15); do
+    ip link show tun0 &>/dev/null && break
+    sleep 1
+done
+
+if ! ip link show tun0 &>/dev/null; then
+    echo "✗ tun0 не поднялся, проверь логи"
+    exit 1
+fi
 
 # Настраиваем маршруты
-sudo ip route add $VPS_IP via $GATEWAY 2>/dev/null
+sudo ip route add $VPS_IP via $GATEWAY dev $IFACE 2>/dev/null
 sudo ip route del default 2>/dev/null
 sudo ip route add default dev tun0
 sudo sh -c 'echo "nameserver 8.8.8.8" > /etc/resolv.conf'
 
-echo "✓ VPN включён! IP: $(curl -s ifconfig.me)"
+echo "✓ VPN включён! IP: $(curl -s --max-time 5 ifconfig.me)"
