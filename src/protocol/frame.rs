@@ -139,12 +139,12 @@ impl std::error::Error for FrameError {}
 
 // Округляем размер до ближайшего блока: 512, 1024, 2048 байт
 fn padding_to_add(current_len: usize) -> usize {
-    let target = 512usize;
-    if current_len >= target {
-        0
-    } else {
-        target - current_len
-    }      
+    let target = [512, 1024, 2048]
+        .iter()
+        .find(|&&block| current_len <= block)
+        .copied()
+        .unwrap_or(((current_len / 2048) + 1) * 2048);
+    target - current_len  
 }
 
 // Текущее время в секундах
