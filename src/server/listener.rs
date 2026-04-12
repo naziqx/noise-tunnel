@@ -10,10 +10,8 @@ use crate::protocol::frame::{Frame, FrameType};
 use native_tls::{Identity, TlsAcceptor};
 use std::fs;
 
-// Максимум одновременных клиентов
 const MAX_CLIENTS: u8 = 50;
 
-// Пул свободных слотов — общий для всех потоков
 type SlotPool = Arc<Mutex<Vec<u8>>>;
 
 pub async fn run(addr: &str, server_keys: Keypair) -> anyhow::Result<()> {
@@ -31,7 +29,6 @@ pub async fn run(addr: &str, server_keys: Keypair) -> anyhow::Result<()> {
     println!("[сервер] слушаю на {} (TLS)", addr);
     println!("[сервер] максимум клиентов: {}", MAX_CLIENTS);
 
-    // Инициализируем пул: [0, 1, 2, ..., 49]
     let pool: SlotPool = Arc::new(Mutex::new((0..MAX_CLIENTS).collect()));
 
     loop {
@@ -82,9 +79,9 @@ async fn handle_client(
         }
     };
 
-    let tun_name   = format!("tun{}", slot);
-    let client_ip  = format!("172.16.0.{}", slot + 2);   // .2 - .51
-    let server_ip  = format!("172.16.1.{}", slot + 2);   // отдельная подсеть для серверной стороны
+    let tun_name  = format!("tun{}", slot);
+    let client_ip = format!("172.16.0.{}", slot + 2);
+    let server_ip = format!("172.16.1.{}", slot + 2);
 
     println!("[сервер] слот #{} → {} (клиент: {}, сервер: {})",
         slot, tun_name, client_ip, server_ip);
@@ -110,13 +107,21 @@ async fn handle_client(
 
     let session = Arc::new(Mutex::new(hs.into_transport()?));
 
+    // ── Отправляем клиенту его IP ────────────────────────
+    {
+        let mut sess = session.lock().await;
+        let ip_msg = sess.encrypt(client_ip.as_bytes())?;
+        ws_tx.send(Message::Binary(ip_msg.into())).await?;
+        println!("[сервер] → IP {} отправлен клиенту (слот #{})", client_ip, slot);
+    }
+
     // ── Создаём TUN для этого клиента ───────────────────
     let mut tun_config = tun::Configuration::default();
     tun_config
         .name(&tun_name)
         .address(server_ip.as_str())
         .destination(client_ip.as_str())
-        .netmask("255.255.255.255")  // /32 точка-точка
+        .netmask("255.255.255.255")
         .mtu(1420)
         .up();
 
@@ -127,7 +132,6 @@ async fn handle_client(
         Ok(d) => d,
         Err(e) => {
             eprintln!("[сервер] ошибка создания {}: {}", tun_name, e);
-            // Возвращаем слот в пул
             let mut p = pool.lock().await;
             p.push(slot);
             p.sort_unstable();
@@ -137,12 +141,10 @@ async fn handle_client(
 
     println!("[сервер] ✓ {} создан ({} ↔ {})", tun_name, server_ip, client_ip);
 
-    // Маршрут до клиента
     tokio::process::Command::new("ip")
         .args(["route", "add", &client_ip, "dev", &tun_name])
         .output().await.ok();
 
-    // NAT для этого клиента
     tokio::process::Command::new("iptables")
         .args(["-t", "nat", "-A", "POSTROUTING",
                "-s", &client_ip, "-j", "MASQUERADE"])
@@ -152,7 +154,6 @@ async fn handle_client(
     let ws_tx         = Arc::new(Mutex::new(ws_tx));
     let session_clone = session.clone();
     let ws_tx_clone   = ws_tx.clone();
-    let client_ip_c   = client_ip.clone();
     let tun_name_c    = tun_name.clone();
 
     // ── TUN → WebSocket ──────────────────────────────────
@@ -233,12 +234,11 @@ async fn handle_client(
                "-s", &client_ip, "-j", "MASQUERADE"])
         .output().await.ok();
 
-    // Возвращаем слот в пул
     {
         let mut p = pool.lock().await;
         p.push(slot);
-        p.sort_unstable(); // меньшие номера берутся первыми
-        println!("[сервер] слот #{} возвращён в пул. Свободно: {}/{}", 
+        p.sort_unstable();
+        println!("[сервер] слот #{} возвращён в пул. Свободно: {}/{}",
             slot, p.len(), MAX_CLIENTS);
     }
 

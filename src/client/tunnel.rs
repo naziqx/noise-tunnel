@@ -1,9 +1,7 @@
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::connect_async_tls_with_config;
 use tokio_tungstenite::Connector;
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
 
 use crate::protocol::noise::{Handshake, Keypair};
 use crate::protocol::frame::{Frame, FrameType};
@@ -14,7 +12,7 @@ pub async fn run(
     my_keys:           Keypair,
     server_public_key: Vec<u8>,
 ) -> anyhow::Result<()> {
-    println!("[Client] Connect to {}...", server_url);
+    println!("[клиент] подключаюсь к {}...", server_url);
 
     let connector = Connector::NativeTls(native_tls::TlsConnector::new()?);
     let (ws, _) = tokio_tungstenite::connect_async_tls_with_config(
@@ -25,46 +23,52 @@ pub async fn run(
     ).await?;
     let (mut ws_tx, mut ws_rx) = ws.split();
 
-    println!("[Client] WebSocket installed, starting handshake...");
+    println!("[клиент] WebSocket установлен, начинаю handshake...");
 
-    // ── Noise XX handshake ──────────────────────────────────────
+    // ── Noise XX handshake ───────────────────────────────
     let mut hs = Handshake::initiate(&my_keys.private, &server_public_key)?;
 
     let msg1 = hs.write_message(&[])?;
     ws_tx.send(Message::Binary(msg1.into())).await?;
-    println!("[Client] → msg1 send");
+    println!("[клиент] → msg1 отправлен");
 
     let msg2 = ws_rx.next().await
-        .ok_or(anyhow::anyhow!("connection close"))??;
+        .ok_or(anyhow::anyhow!("соединение закрыто"))??;
     hs.read_message(&msg2.into_data())?;
-    println!("[Client] ← msg2 received");
+    println!("[клиент] ← msg2 получен");
 
     let msg3 = hs.write_message(&[])?;
     ws_tx.send(Message::Binary(msg3.into())).await?;
-    println!("[Client] → msg3 send");
+    println!("[клиент] → msg3 отправлен");
 
-    println!("[Client] ✓ Handshake completed!");
+    println!("[клиент] ✓ Handshake завершён!");
 
-    let session = hs.into_transport()?;
+    let session = std::sync::Arc::new(tokio::sync::Mutex::new(hs.into_transport()?));
 
-    // Оборачиваем сессию в Arc<Mutex> — использовать из двух задач
-    let session = std::sync::Arc::new(tokio::sync::Mutex::new(session));
+    // ── Получаем назначенный IP от сервера ───────────────
+    let ip_msg = ws_rx.next().await
+        .ok_or(anyhow::anyhow!("сервер не прислал IP"))??;
 
-    // ── Создаём TUN интерфейс ───────────────────────────────────
-    let tun_dev = crate::client::tun::create_tun()?;
+    let assigned_ip = {
+        let mut sess = session.lock().await;
+        let decrypted = sess.decrypt(&ip_msg.into_data())?;
+        String::from_utf8(decrypted)?
+    };
 
-    // Разделяем TUN на чтение и запись
+    println!("[клиент] ✓ Получен IP от сервера: {}", assigned_ip);
+
+    // Сохраняем IP для vpn-up.sh
+    std::fs::write("/tmp/vpn.client_ip", &assigned_ip)?;
+
+    // ── Создаём TUN с назначенным IP ────────────────────
+    let tun_dev = crate::client::tun::create_tun(&assigned_ip)?;
     let (mut tun_rx, mut tun_tx) = tokio::io::split(tun_dev);
 
-    // Разделяем WebSocket
-    // ws_tx уже есть, ws_rx уже есть
-    let ws_tx = std::sync::Arc::new(tokio::sync::Mutex::new(ws_tx));
+    let ws_tx       = std::sync::Arc::new(tokio::sync::Mutex::new(ws_tx));
+    let sess_clone  = session.clone();
+    let ws_tx_clone = ws_tx.clone();
 
-    let session_clone = session.clone();
-    let ws_tx_clone   = ws_tx.clone();
-
-    // ──  TUN → WebSocket ───────────────────────────────
-    // Читаем IP пакеты с TUN и шлём на сервер
+    // ── TUN → WebSocket ──────────────────────────────────
     let tun_to_ws = tokio::spawn(async move {
         let mut buf = vec![0u8; 2048];
         loop {
@@ -74,12 +78,11 @@ pub async fn run(
                 Err(e) => { eprintln!("[клиент] TUN read ошибка: {}", e); break; }
             };
 
-            let packet = Bytes::copy_from_slice(&buf[..n]);
-            let frame  = Frame::new_data(packet);
+            let frame   = Frame::new_data(Bytes::copy_from_slice(&buf[..n]));
             let encoded = frame.encode();
 
             let encrypted = {
-                let mut sess = session_clone.lock().await;
+                let mut sess = sess_clone.lock().await;
                 match sess.encrypt(&encoded) {
                     Ok(e) => e,
                     Err(e) => { eprintln!("[клиент] encrypt ошибка: {}", e); break; }
@@ -93,8 +96,7 @@ pub async fn run(
         }
     });
 
-    // ── WebSocket → TUN ───────────────────────────────
-    // Получаем пакеты от сервера и пишем в TUN
+    // ── WebSocket → TUN ──────────────────────────────────
     let ws_to_tun = tokio::spawn(async move {
         while let Some(msg) = ws_rx.next().await {
             let msg = match msg {
@@ -125,13 +127,15 @@ pub async fn run(
         }
     });
 
-    println!("[Client]  Tuunel start! Traffic goes through TUN");
+    println!("[клиент] Туннель запущен! Трафик идёт через TUN");
 
-    // Ждём завершения любой из задач
     tokio::select! {
-        _ = tun_to_ws => println!("[Client] TUN→WS  completed"),
-        _ = ws_to_tun => println!("[Client] WS→TUN  completed"),
+        _ = tun_to_ws => println!("[клиент] TUN→WS завершена"),
+        _ = ws_to_tun => println!("[клиент] WS→TUN завершена"),
     }
+
+    // Чистим файл при завершении
+    std::fs::remove_file("/tmp/vpn.client_ip").ok();
 
     Ok(())
 }
