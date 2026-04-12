@@ -204,7 +204,7 @@ pub async fn run(
 
     // ── TUN → WebSocket ──────────────────────────────────
     let tun_to_ws = tokio::spawn(async move {
-        let mut buf = vec![0u8; 2048];
+        let mut buf = vec![0u8; 65535];
         loop {
             let n = match tun_rx.read(&mut buf).await {
                 Ok(n) if n == 0 => break,
