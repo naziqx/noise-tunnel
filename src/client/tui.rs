@@ -10,6 +10,8 @@ use ratatui::{
     widgets::*,
 };
 
+const CONFIG_FILE: &str = "/tmp/vpn.config";
+
 // ── Состояние подключения ────────────────────────────────
 #[derive(Clone, PartialEq)]
 pub enum ConnectionState {
@@ -19,18 +21,38 @@ pub enum ConnectionState {
     Error(String),
 }
 
-// ── Экран ────────────────────────────────────────────────
 #[derive(Clone, PartialEq)]
 enum Screen {
     Main,
     Settings,
 }
 
-// ── Поле ввода ───────────────────────────────────────────
 #[derive(Clone, PartialEq)]
 enum InputField {
     ServerUrl,
     ServerKey,
+}
+
+// ── Конфиг (сохраняется на диск) ─────────────────────────
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct Config {
+    server_url: String,
+    server_key: String,
+}
+
+impl Config {
+    fn load() -> Self {
+        std::fs::read_to_string(CONFIG_FILE)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self) {
+        if let Ok(json) = serde_json::to_string(self) {
+            std::fs::write(CONFIG_FILE, json).ok();
+        }
+    }
 }
 
 // ── Общее состояние приложения ───────────────────────────
@@ -43,11 +65,13 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(server_url: String, server_key: String) -> Self {
+        // Загружаем сохранённый конфиг, аргументы имеют приоритет
+        let cfg = Config::load();
         Self {
             connection: ConnectionState::Disconnected,
             logs: Vec::new(),
-            server_url,
-            server_key,
+            server_url: if server_url.is_empty() { cfg.server_url } else { server_url },
+            server_key: if server_key.is_empty() { cfg.server_key } else { server_key },
         }
     }
 
@@ -58,9 +82,16 @@ impl AppState {
             self.logs.remove(0);
         }
     }
+
+    pub fn save_config(&self) {
+        Config {
+            server_url: self.server_url.clone(),
+            server_key: self.server_key.clone(),
+        }.save();
+    }
 }
 
-// ── Команды от TUI к туннелю ─────────────────────────────
+// ── Команды ──────────────────────────────────────────────
 pub enum TunnelCommand {
     Connect { url: String, key: String },
     Disconnect,
@@ -80,7 +111,6 @@ pub fn run_tui(
     let mut screen       = Screen::Main;
     let mut active_field = InputField::ServerUrl;
 
-    // Инициализируем поля из текущего состояния
     let (mut url_input, mut key_input) = {
         let s = state.lock().unwrap();
         (s.server_url.clone(), s.server_key.clone())
@@ -117,7 +147,7 @@ pub fn run_tui(
                                 } else {
                                     state.lock().unwrap().add_log("Подключаюсь...");
                                     let _ = cmd_tx.send(TunnelCommand::Connect {
-                                        url: url, key: srv_key
+                                        url, key: srv_key
                                     });
                                 }
                             }
@@ -134,7 +164,6 @@ pub fn run_tui(
                         }
 
                         KeyCode::Char('s') | KeyCode::Char('S') => {
-                            // Обновляем поля из текущего состояния при входе в настройки
                             let s = state.lock().unwrap();
                             url_input = s.server_url.clone();
                             key_input = s.server_key.clone();
@@ -162,6 +191,7 @@ pub fn run_tui(
                             let mut s = state.lock().unwrap();
                             s.server_url = url_input.clone();
                             s.server_key = key_input.clone();
+                            s.save_config(); // ← сохраняем на диск
                             s.add_log("✓ Настройки сохранены");
                             drop(s);
                             screen = Screen::Main;
@@ -195,7 +225,7 @@ pub fn run_tui(
 
 // ── Главный экран ────────────────────────────────────────
 fn draw_main(f: &mut Frame, state: &AppState) {
-    let area = f.size(); // ratatui 0.26 использует size()
+    let area = f.size();
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -207,14 +237,12 @@ fn draw_main(f: &mut Frame, state: &AppState) {
         ])
         .split(area);
 
-    // Заголовок
     let title = Paragraph::new("NOISE TUNNEL — КЛИЕНТ")
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::ALL))
         .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
     f.render_widget(title, chunks[0]);
 
-    // Статус
     let (status_text, status_color) = match &state.connection {
         ConnectionState::Disconnected =>
             ("● ОТКЛЮЧЁН".to_string(), Color::Red),
@@ -238,7 +266,6 @@ fn draw_main(f: &mut Frame, state: &AppState) {
         .style(Style::default().fg(status_color));
     f.render_widget(status, chunks[1]);
 
-    // Логи
     let log_items: Vec<ListItem> = state.logs.iter().rev().take(100)
         .map(|l| {
             let color = if l.contains('✓') || l.contains('♥') {
@@ -260,7 +287,6 @@ fn draw_main(f: &mut Frame, state: &AppState) {
             .borders(Borders::ALL));
     f.render_widget(logs, chunks[2]);
 
-    // Подсказки
     let hints = match &state.connection {
         ConnectionState::Disconnected | ConnectionState::Error(_) =>
             " [C] Подключить   [S] Настройки   [Q] Выход ",
@@ -303,7 +329,6 @@ fn draw_settings(
         .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
     f.render_widget(title, chunks[0]);
 
-    // URL поле
     let url_border = if *active_field == InputField::ServerUrl {
         Style::default().fg(Color::Yellow)
     } else {
@@ -316,13 +341,11 @@ fn draw_settings(
             .border_style(url_border));
     f.render_widget(url_w, chunks[1]);
 
-    // KEY поле
     let key_display = if key_input.is_empty() {
         String::new()
     } else if *active_field == InputField::ServerKey {
         key_input.to_string()
     } else {
-        // Показываем начало и конец ключа
         let start = &key_input[..8.min(key_input.len())];
         let end   = &key_input[key_input.len().saturating_sub(8)..];
         format!("{}...{}", start, end)
