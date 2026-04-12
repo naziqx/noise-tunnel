@@ -16,3 +16,6 @@ clap = { version = "4", features = ["derive"] }
 tun = { version = "0.6", features = ["async"] }
 native-tls = "0.2"
 tokio-native-tls = "0.3"
+ratatui = "0.26"
+crossterm = "0.27"
+chrono = "0.4"
