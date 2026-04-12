@@ -11,6 +11,7 @@ use native_tls::{Identity, TlsAcceptor};
 use std::fs;
 
 const MAX_CLIENTS: u8 = 50;
+const KEEPALIVE_INTERVAL: u64 = 30;
 
 type SlotPool = Arc<Mutex<Vec<u8>>>;
 
@@ -24,6 +25,15 @@ pub async fn run(addr: &str, server_keys: Keypair) -> anyhow::Result<()> {
     let identity = Identity::from_pkcs8(cert_str.as_bytes(), key_str.as_bytes())?;
     let acceptor = TlsAcceptor::new(identity)?;
     let acceptor = tokio_native_tls::TlsAcceptor::from(acceptor);
+
+    // ── Чистим старые TUN интерфейсы при старте ──────────
+    println!("[сервер] чищу старые TUN интерфейсы...");
+    for i in 0..MAX_CLIENTS {
+        let tun_name = format!("tun{}", i);
+        tokio::process::Command::new("ip")
+            .args(["link", "delete", &tun_name])
+            .output().await.ok();
+    }
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("[сервер] слушаю на {} (TLS)", addr);
@@ -151,10 +161,16 @@ async fn handle_client(
         .output().await.ok();
 
     let (mut tun_rx, mut tun_tx) = tokio::io::split(tun_dev);
-    let ws_tx         = Arc::new(Mutex::new(ws_tx));
-    let session_clone = session.clone();
-    let ws_tx_clone   = ws_tx.clone();
-    let tun_name_c    = tun_name.clone();
+    let ws_tx = Arc::new(Mutex::new(ws_tx));
+
+    // Клонируем ВСЕ Arc до того как они переместятся в замыкания
+    let sess_tun_to_ws = session.clone();
+    let sess_ws_to_tun = session.clone();
+    let sess_ka        = session.clone();
+    let ws_tx_tun      = ws_tx.clone();
+    let ws_tx_ka       = ws_tx.clone();
+    let tun_name_c     = tun_name.clone();
+    let tun_name_ka    = tun_name.clone();
 
     // ── TUN → WebSocket ──────────────────────────────────
     let tun_to_ws = tokio::spawn(async move {
@@ -170,14 +186,14 @@ async fn handle_client(
             let encoded = frame.encode();
 
             let encrypted = {
-                let mut sess = session_clone.lock().await;
+                let mut sess = sess_tun_to_ws.lock().await;
                 match sess.encrypt(&encoded) {
                     Ok(e) => e,
                     Err(e) => { eprintln!("[{}] encrypt: {}", tun_name_c, e); break; }
                 }
             };
 
-            let mut tx = ws_tx_clone.lock().await;
+            let mut tx = ws_tx_tun.lock().await;
             if tx.send(Message::Binary(encrypted.into())).await.is_err() {
                 break;
             }
@@ -195,7 +211,7 @@ async fn handle_client(
             if !msg.is_binary() { continue; }
 
             let decrypted = {
-                let mut sess = session.lock().await;
+                let mut sess = sess_ws_to_tun.lock().await;
                 match sess.decrypt(&msg.into_data()) {
                     Ok(d) => d,
                     Err(e) => { eprintln!("[сервер] decrypt: {}", e); break; }
@@ -215,11 +231,38 @@ async fn handle_client(
         }
     });
 
-    println!("[сервер] туннель {} активен!", tun_name);
+    // ── Keepalive ────────────────────────────────────────
+    let keepalive = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(KEEPALIVE_INTERVAL)).await;
+
+            let frame   = Frame::new_keepalive();
+            let encoded = frame.encode();
+
+            let encrypted = {
+                let mut sess = sess_ka.lock().await;
+                match sess.encrypt(&encoded) {
+                    Ok(e) => e,
+                    Err(e) => { eprintln!("[{}] keepalive encrypt: {}", tun_name_ka, e); break; }
+                }
+            };
+
+            let mut tx = ws_tx_ka.lock().await;
+            if tx.send(Message::Binary(encrypted.into())).await.is_err() {
+                break;
+            }
+
+            println!("[{}] ♥ keepalive отправлен", tun_name_ka);
+        }
+    });
+
+    println!("[сервер] туннель {} активен! Keepalive каждые {}с",
+        tun_name, KEEPALIVE_INTERVAL);
 
     tokio::select! {
         _ = tun_to_ws => println!("[{}] TUN→WS завершена", tun_name),
         _ = ws_to_tun => println!("[{}] WS→TUN завершена", tun_name),
+        _ = keepalive => println!("[{}] keepalive завершён", tun_name),
     }
 
     // ── Чистка при отключении ────────────────────────────
@@ -232,6 +275,11 @@ async fn handle_client(
     tokio::process::Command::new("iptables")
         .args(["-t", "nat", "-D", "POSTROUTING",
                "-s", &client_ip, "-j", "MASQUERADE"])
+        .output().await.ok();
+
+    // Удаляем TUN интерфейс
+    tokio::process::Command::new("ip")
+        .args(["link", "delete", &tun_name])
         .output().await.ok();
 
     {
