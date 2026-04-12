@@ -1,5 +1,5 @@
 #!/bin/bash
-VPS_IP="176.124.203.112"
+VPS_IP="193.233.209.188"
 KEY_FILE="/tmp/vpn.key"
 
 # Определяем gateway и интерфейс динамически
@@ -26,14 +26,17 @@ echo $SERVER_KEY > $KEY_FILE
 
 # Сохраняем gateway для vpn-down.sh
 echo "$GATEWAY" > /tmp/vpn.gw
-echo "$IFACE" > /tmp/vpn.iface
+echo "$IFACE"   > /tmp/vpn.iface
+
+# Чистим старый IP перед запуском
+rm -f /tmp/vpn.client_ip
 
 # Запускаем туннель в фоне
 sudo ~/noise-tunnel/target/release/noise-tunnel client --server-key $SERVER_KEY &
 TUN_PID=$!
 echo $TUN_PID > /tmp/vpn.pid
 
-# Ждём пока поднимется tun0 (до 15 секунд)
+# Ждём пока tun0 поднимется (до 15 секунд)
 echo "Подключаюсь..."
 for i in $(seq 1 15); do
     ip link show tun0 &>/dev/null && break
@@ -44,6 +47,21 @@ if ! ip link show tun0 &>/dev/null; then
     echo "✗ tun0 не поднялся, проверь логи"
     exit 1
 fi
+
+# Ждём пока клиент получит IP от сервера (до 10 секунд)
+for i in $(seq 1 10); do
+    [ -f /tmp/vpn.client_ip ] && break
+    sleep 1
+done
+
+CLIENT_IP=$(cat /tmp/vpn.client_ip 2>/dev/null)
+if [ -z "$CLIENT_IP" ]; then
+    echo "✗ Не удалось получить IP от сервера"
+    sudo kill $TUN_PID 2>/dev/null
+    exit 1
+fi
+
+echo "Назначен IP: $CLIENT_IP"
 
 # Настраиваем маршруты
 sudo ip route add $VPS_IP via $GATEWAY dev $IFACE 2>/dev/null
