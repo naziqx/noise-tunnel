@@ -259,6 +259,10 @@ async fn handle_client(
     println!("[сервер] туннель {} активен! Keepalive каждые {}с",
         tun_name, KEEPALIVE_INTERVAL);
 
+    let abort_tun_to_ws = tun_to_ws.abort_handle();
+    let abort_ws_to_tun = ws_to_tun.abort_handle();
+    let abort_keepalive = keepalive.abort_handle();
+
     tokio::select! {
         _ = tun_to_ws => println!("[{}] TUN→WS завершена", tun_name),
         _ = ws_to_tun => println!("[{}] WS→TUN завершена", tun_name),

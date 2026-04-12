@@ -287,6 +287,10 @@ pub async fn run(
     });
 
     log(&state, "✓ Туннель активен!");
+    
+    let abort_tun_to_ws = tun_to_ws.abort_handle();
+    let abort_ws_to_tun = ws_to_tun.abort_handle();
+    let abort_keepalive = keepalive.abort_handle();
 
     tokio::select! {
         _ = tun_to_ws  => log(&state, "TUN→WS завершена"),
@@ -294,6 +298,9 @@ pub async fn run(
         _ = keepalive  => log(&state, "keepalive завершён"),
         _ = &mut stop_rx => log(&state, "Получен сигнал остановки"),
     }
+    abort_tun_to_ws.abort();
+    abort_ws_to_tun.abort();
+    abort_keepalive.abort();
 
     // ── Чистка ───────────────────────────────────────────
     restore_routes(&state).await;
