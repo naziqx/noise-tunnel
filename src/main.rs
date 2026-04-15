@@ -107,18 +107,15 @@ async fn main() -> anyhow::Result<()> {
 
             let state = Arc::new(Mutex::new(AppState::new(url, server_key)));
 
-            // Используем tokio unbounded channel — он Send + Sync
             let (cmd_tx, mut cmd_rx) =
                 tokio::sync::mpsc::unbounded_channel::<TunnelCommand>();
 
             let state_for_tunnel = state.clone();
 
-            // stop_tx хранится здесь — при Disconnect отправляем сигнал
             let stop_tx_cell: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>> =
                 Arc::new(Mutex::new(None));
             let stop_cell = stop_tx_cell.clone();
 
-            // Поток обработки команд
             tokio::spawn(async move {
                 while let Some(cmd) = cmd_rx.recv().await {
                     match cmd {
@@ -174,7 +171,6 @@ async fn main() -> anyhow::Result<()> {
                 }
             });
 
-            // TUI запускается в основном потоке
             client::tui::run_tui(state, cmd_tx)?;
         }
     }

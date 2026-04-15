@@ -3,6 +3,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 use crate::protocol::noise::{Handshake, Keypair};
 use crate::protocol::frame::{Frame, FrameType};
@@ -163,7 +164,9 @@ async fn handle_client(
     let (mut tun_rx, mut tun_tx) = tokio::io::split(tun_dev);
     let ws_tx = Arc::new(Mutex::new(ws_tx));
 
-    // Клонируем ВСЕ Arc до того как они переместятся в замыкания
+    // Единый токен отмены для всех трёх задач этого клиента
+    let cancel = CancellationToken::new();
+
     let sess_tun_to_ws = session.clone();
     let sess_ws_to_tun = session.clone();
     let sess_ka        = session.clone();
@@ -171,15 +174,20 @@ async fn handle_client(
     let ws_tx_ka       = ws_tx.clone();
     let tun_name_c     = tun_name.clone();
     let tun_name_ka    = tun_name.clone();
+    let cancel_tun     = cancel.clone();
+    let cancel_ws      = cancel.clone();
+    let cancel_ka      = cancel.clone();
 
     // ── TUN → WebSocket ──────────────────────────────────
     let tun_to_ws = tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
         loop {
-            let n = match tun_rx.read(&mut buf).await {
-                Ok(n) if n == 0 => break,
-                Ok(n) => n,
-                Err(e) => { eprintln!("[{}] TUN read: {}", tun_name_c, e); break; }
+            let n = tokio::select! {
+                res = tun_rx.read(&mut buf) => match res {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                },
+                _ = cancel_tun.cancelled() => break,
             };
 
             let frame   = Frame::new_data(bytes::Bytes::copy_from_slice(&buf[..n]));
@@ -202,10 +210,13 @@ async fn handle_client(
 
     // ── WebSocket → TUN ──────────────────────────────────
     let ws_to_tun = tokio::spawn(async move {
-        while let Some(msg) = ws_rx.next().await {
-            let msg = match msg {
-                Ok(m) => m,
-                Err(_) => break,
+        loop {
+            let msg = tokio::select! {
+                res = ws_rx.next() => match res {
+                    Some(Ok(m)) => m,
+                    _ => break,
+                },
+                _ = cancel_ws.cancelled() => break,
             };
 
             if !msg.is_binary() { continue; }
@@ -231,10 +242,16 @@ async fn handle_client(
         }
     });
 
-    // ── Keepalive ────────────────────────────────────────
+    // ── Keepalive — теперь с CancellationToken ───────────
     let keepalive = tokio::spawn(async move {
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(KEEPALIVE_INTERVAL)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(tokio::time::Duration::from_secs(KEEPALIVE_INTERVAL)) => {}
+                _ = cancel_ka.cancelled() => {
+                    // Чистое завершение — не отправляем keepalive после дисконнекта
+                    break;
+                }
+            }
 
             let frame   = Frame::new_keepalive();
             let encoded = frame.encode();
@@ -259,15 +276,15 @@ async fn handle_client(
     println!("[сервер] туннель {} активен! Keepalive каждые {}с",
         tun_name, KEEPALIVE_INTERVAL);
 
-    let abort_tun_to_ws = tun_to_ws.abort_handle();
-    let abort_ws_to_tun = ws_to_tun.abort_handle();
-    let abort_keepalive = keepalive.abort_handle();
-
+    // Ждём первого завершения — потом отменяем остальные
     tokio::select! {
         _ = tun_to_ws => println!("[{}] TUN→WS завершена", tun_name),
         _ = ws_to_tun => println!("[{}] WS→TUN завершена", tun_name),
         _ = keepalive => println!("[{}] keepalive завершён", tun_name),
     }
+
+    // Отменяем оставшиеся задачи — keepalive больше не отправится
+    cancel.cancel();
 
     // ── Чистка при отключении ────────────────────────────
     println!("[сервер] слот #{} освобождается...", slot);
@@ -281,7 +298,6 @@ async fn handle_client(
                "-s", &client_ip, "-j", "MASQUERADE"])
         .output().await.ok();
 
-    // Удаляем TUN интерфейс
     tokio::process::Command::new("ip")
         .args(["link", "delete", &tun_name])
         .output().await.ok();

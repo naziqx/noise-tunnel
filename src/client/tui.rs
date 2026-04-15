@@ -17,6 +17,7 @@ const CONFIG_FILE: &str = "/tmp/vpn.config";
 pub enum ConnectionState {
     Disconnected,
     Connecting,
+    Reconnecting { attempt: u32 },
     Connected { assigned_ip: String, started_at: Instant },
     Error(String),
 }
@@ -55,23 +56,50 @@ impl Config {
     }
 }
 
+// ── Статистика трафика ───────────────────────────────────
+#[derive(Default, Clone)]
+pub struct TrafficStats {
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+}
+
+impl TrafficStats {
+    pub fn rx_str(&self) -> String { format_bytes(self.rx_bytes) }
+    pub fn tx_str(&self) -> String { format_bytes(self.tx_bytes) }
+}
+
+fn format_bytes(b: u64) -> String {
+    if b < 1024 {
+        format!("{} B", b)
+    } else if b < 1024 * 1024 {
+        format!("{:.1} KB", b as f64 / 1024.0)
+    } else if b < 1024 * 1024 * 1024 {
+        format!("{:.2} MB", b as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2} GB", b as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
 // ── Общее состояние приложения ───────────────────────────
 pub struct AppState {
     pub connection: ConnectionState,
     pub logs:       Vec<String>,
     pub server_url: String,
     pub server_key: String,
+    pub stats:      TrafficStats,
+    pub auto_reconnect: bool,
 }
 
 impl AppState {
     pub fn new(server_url: String, server_key: String) -> Self {
-        // Загружаем сохранённый конфиг, аргументы имеют приоритет
         let cfg = Config::load();
         Self {
             connection: ConnectionState::Disconnected,
             logs: Vec::new(),
             server_url: if server_url.is_empty() { cfg.server_url } else { server_url },
             server_key: if server_key.is_empty() { cfg.server_key } else { server_key },
+            stats: TrafficStats::default(),
+            auto_reconnect: true,
         }
     }
 
@@ -81,6 +109,18 @@ impl AppState {
         if self.logs.len() > 200 {
             self.logs.remove(0);
         }
+    }
+
+    pub fn add_rx(&mut self, bytes: u64) {
+        self.stats.rx_bytes += bytes;
+    }
+
+    pub fn add_tx(&mut self, bytes: u64) {
+        self.stats.tx_bytes += bytes;
+    }
+
+    pub fn reset_stats(&mut self) {
+        self.stats = TrafficStats::default();
     }
 
     pub fn save_config(&self) {
@@ -145,7 +185,10 @@ pub fn run_tui(
                                     state.lock().unwrap()
                                         .add_log("✗ Укажи URL и ключ в настройках (S)");
                                 } else {
-                                    state.lock().unwrap().add_log("Подключаюсь...");
+                                    let mut s = state.lock().unwrap();
+                                    s.add_log("Подключаюсь...");
+                                    s.reset_stats();
+                                    drop(s);
                                     let _ = cmd_tx.send(TunnelCommand::Connect {
                                         url, key: srv_key
                                     });
@@ -156,7 +199,9 @@ pub fn run_tui(
                         KeyCode::Char('d') | KeyCode::Char('D') => {
                             let conn = state.lock().unwrap().connection.clone();
                             if matches!(conn,
-                                ConnectionState::Connected { .. } | ConnectionState::Connecting)
+                                ConnectionState::Connected { .. }
+                                | ConnectionState::Connecting
+                                | ConnectionState::Reconnecting { .. })
                             {
                                 state.lock().unwrap().add_log("Отключаюсь...");
                                 let _ = cmd_tx.send(TunnelCommand::Disconnect);
@@ -191,7 +236,7 @@ pub fn run_tui(
                             let mut s = state.lock().unwrap();
                             s.server_url = url_input.clone();
                             s.server_key = key_input.clone();
-                            s.save_config(); // ← сохраняем на диск
+                            s.save_config();
                             s.add_log("✓ Настройки сохранены");
                             drop(s);
                             screen = Screen::Main;
@@ -230,48 +275,73 @@ fn draw_main(f: &mut Frame, state: &AppState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
-            Constraint::Length(5),
-            Constraint::Min(5),
-            Constraint::Length(3),
+            Constraint::Length(3),  // заголовок
+            Constraint::Length(6),  // статус + статистика
+            Constraint::Min(5),     // логи
+            Constraint::Length(3),  // подсказки
         ])
         .split(area);
 
-    let title = Paragraph::new("NOISE TUNNEL — КЛИЕНТ")
+    // ── Заголовок ────────────────────────────────────────
+    let title = Paragraph::new("⚡ NOISE TUNNEL — КЛИЕНТ")
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::ALL))
         .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
     f.render_widget(title, chunks[0]);
+
+    // ── Статус + трафик ──────────────────────────────────
+    let status_area = chunks[1];
+    let status_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(status_area);
 
     let (status_text, status_color) = match &state.connection {
         ConnectionState::Disconnected =>
             ("● ОТКЛЮЧЁН".to_string(), Color::Red),
         ConnectionState::Connecting =>
             ("◌ ПОДКЛЮЧЕНИЕ...".to_string(), Color::Yellow),
+        ConnectionState::Reconnecting { attempt } =>
+            (format!("↻ ПЕРЕПОДКЛЮЧЕНИЕ... (попытка {})", attempt), Color::Yellow),
         ConnectionState::Connected { assigned_ip, started_at } => {
             let e = started_at.elapsed();
             let h = e.as_secs() / 3600;
             let m = (e.as_secs() % 3600) / 60;
             let s = e.as_secs() % 60;
-            (format!("● ПОДКЛЮЧЁН  |  IP: {}  |  Аптайм: {:02}:{:02}:{:02}",
-                assigned_ip, h, m, s), Color::Green)
+            (format!("● ПОДКЛЮЧЁН\nIP: {}\nАптайм: {:02}:{:02}:{:02}", assigned_ip, h, m, s),
+             Color::Green)
         }
         ConnectionState::Error(e) =>
-            (format!("✗ ОШИБКА: {}", e), Color::Red),
+            (format!("✗ ОШИБКА:\n{}", e), Color::Red),
     };
 
     let status_body = format!("{}\nСервер: {}", status_text, state.server_url);
     let status = Paragraph::new(status_body)
         .block(Block::default().title(" Статус ").borders(Borders::ALL))
         .style(Style::default().fg(status_color));
-    f.render_widget(status, chunks[1]);
+    f.render_widget(status, status_chunks[0]);
 
+    // ── Статистика трафика ───────────────────────────────
+    let traffic_text = format!(
+        "↓ RX: {}\n↑ TX: {}\n\nАвто-реконнект: {}",
+        state.stats.rx_str(),
+        state.stats.tx_str(),
+        if state.auto_reconnect { "вкл" } else { "выкл" },
+    );
+    let traffic = Paragraph::new(traffic_text)
+        .block(Block::default().title(" Трафик ").borders(Borders::ALL))
+        .style(Style::default().fg(Color::Cyan));
+    f.render_widget(traffic, status_chunks[1]);
+
+    // ── Логи ─────────────────────────────────────────────
     let log_items: Vec<ListItem> = state.logs.iter().rev().take(100)
         .map(|l| {
             let color = if l.contains('✓') || l.contains('♥') {
                 Color::Green
             } else if l.contains('✗') || l.contains("ошибка") || l.contains("Ошибка") {
                 Color::Red
+            } else if l.contains("↻") || l.contains("Переподкл") {
+                Color::Yellow
             } else if l.contains("Подключ") || l.contains("handshake") {
                 Color::Yellow
             } else {
@@ -287,10 +357,11 @@ fn draw_main(f: &mut Frame, state: &AppState) {
             .borders(Borders::ALL));
     f.render_widget(logs, chunks[2]);
 
+    // ── Подсказки ────────────────────────────────────────
     let hints = match &state.connection {
         ConnectionState::Disconnected | ConnectionState::Error(_) =>
             " [C] Подключить   [S] Настройки   [Q] Выход ",
-        ConnectionState::Connecting =>
+        ConnectionState::Connecting | ConnectionState::Reconnecting { .. } =>
             " [D] Отменить   [Q] Выход ",
         ConnectionState::Connected { .. } =>
             " [D] Отключить   [S] Настройки   [Q] Выход ",
