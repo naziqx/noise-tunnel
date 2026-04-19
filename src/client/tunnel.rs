@@ -10,6 +10,7 @@ use crate::client::tui::{AppState, ConnectionState};
 use bytes::Bytes;
 
 const KEEPALIVE_INTERVAL: u64 = 30;
+const ROUTES_SCRIPT: &str = "/usr/local/bin/vpn-routes.sh";
 
 fn log(state: &Arc<Mutex<AppState>>, msg: &str) {
     if let Ok(mut s) = state.lock() {
@@ -17,89 +18,45 @@ fn log(state: &Arc<Mutex<AppState>>, msg: &str) {
     }
 }
 
-// Настраиваем маршруты — то что раньше делал vpn-up.sh
 async fn setup_routes(
-    vps_ip:     &str,
-    client_ip:  &str,
-    state:      &Arc<Mutex<AppState>>,
+    vps_ip:    &str,
+    client_ip: &str,
+    state:     &Arc<Mutex<AppState>>,
 ) -> anyhow::Result<()> {
-    // Определяем текущий gateway и интерфейс
-    let output = tokio::process::Command::new("ip")
-        .args(["route", "show", "default"])
+    let out = tokio::process::Command::new("sudo")
+        .args([ROUTES_SCRIPT, "up", vps_ip, client_ip])
         .output().await?;
 
-    let route_str = String::from_utf8_lossy(&output.stdout);
-    let parts: Vec<&str> = route_str.split_whitespace().collect();
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
 
-    let gateway = parts.iter().position(|&s| s == "via")
-        .and_then(|i| parts.get(i + 1))
-        .copied()
-        .ok_or_else(|| anyhow::anyhow!("не удалось определить gateway"))?;
+    if !out.status.success() {
+        let msg = if stderr.is_empty() { stdout } else { stderr };
+        return Err(anyhow::anyhow!("{}", msg));
+    }
 
-    let iface = parts.iter().position(|&s| s == "dev")
-        .and_then(|i| parts.get(i + 1))
-        .copied()
-        .ok_or_else(|| anyhow::anyhow!("не удалось определить интерфейс"))?;
-
-    log(state, &format!("Маршруты: gateway={} iface={}", gateway, iface));
-
-    // Сохраняем gateway для восстановления при отключении
-    std::fs::write("/tmp/vpn.gw", gateway)?;
-    std::fs::write("/tmp/vpn.iface", iface)?;
-    std::fs::write("/tmp/vpn.vps_ip", vps_ip)?;
-
-    // Маршрут до VPS напрямую (чтобы сам туннель не шёл через tun0)
-    tokio::process::Command::new("sudo")
-        .args(["ip", "route", "add", vps_ip, "via", gateway, "dev", iface])
-        .output().await.ok();
-
-    // Удаляем дефолтный маршрут и направляем всё через tun0
-    tokio::process::Command::new("sudo")
-        .args(["ip", "route", "del", "default"])
-        .output().await.ok();
-
-    tokio::process::Command::new("sudo")
-        .args(["ip", "route", "add", "default", "dev", "tun0"])
-        .output().await.ok();
-
-    // DNS через VPN
-    tokio::process::Command::new("sudo")
-        .args(["sh", "-c", "echo nameserver 8.8.8.8 > /etc/resolv.conf"])
-        .output().await.ok();
-
-    log(state, "✓ Маршруты настроены, трафик идёт через VPN");
+    log(state, &format!("✓ Маршруты настроены ({})", stdout));
     Ok(())
 }
 
-// Восстанавливаем маршруты при отключении
 async fn restore_routes(state: &Arc<Mutex<AppState>>) {
-    let gateway  = std::fs::read_to_string("/tmp/vpn.gw").unwrap_or_default();
-    let iface    = std::fs::read_to_string("/tmp/vpn.iface").unwrap_or_default();
-    let vps_ip   = std::fs::read_to_string("/tmp/vpn.vps_ip").unwrap_or_default();
+    let out = tokio::process::Command::new("sudo")
+        .args([ROUTES_SCRIPT, "down"])
+        .output().await;
 
-    let gateway  = gateway.trim();
-    let iface    = iface.trim();
-    let vps_ip   = vps_ip.trim();
-
-    tokio::process::Command::new("sudo")
-        .args(["ip", "route", "del", "default"])
-        .output().await.ok();
-
-    tokio::process::Command::new("sudo")
-        .args(["ip", "route", "del", vps_ip])
-        .output().await.ok();
-
-    if !gateway.is_empty() {
-        tokio::process::Command::new("sudo")
-            .args(["ip", "route", "add", "default", "via", gateway, "dev", iface])
-            .output().await.ok();
-
-        log(state, &format!("✓ Маршрут восстановлен через {} ({})", gateway, iface));
+    match out {
+        Ok(o) if o.status.success() => {
+            let msg = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            log(state, &format!("✓ Маршруты восстановлены ({})", msg));
+        }
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            log(state, &format!("✗ Ошибка восстановления маршрутов: {}", err));
+        }
+        Err(e) => {
+            log(state, &format!("✗ Не удалось запустить скрипт: {}", e));
+        }
     }
-
-    tokio::process::Command::new("sudo")
-        .args(["sh", "-c", "echo nameserver 1.1.1.1 > /etc/resolv.conf"])
-        .output().await.ok();
 }
 
 pub async fn run(
@@ -109,7 +66,6 @@ pub async fn run(
     state:             Arc<Mutex<AppState>>,
     mut stop_rx:       tokio::sync::oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
-    // Получаем VPS IP из URL (wss://1.2.3.4:port или wss://domain:port)
     let vps_host = server_url
         .trim_start_matches("wss://")
         .trim_start_matches("ws://")
@@ -178,12 +134,11 @@ pub async fn run(
     let tun_dev = crate::client::tun::create_tun(&assigned_ip)?;
     log(&state, &format!("✓ TUN создан ({})", assigned_ip));
 
-    // ── Настраиваем маршруты ─────────────────────────────
+    // ── Настраиваем маршруты через скрипт ────────────────
     if let Err(e) = setup_routes(&vps_host, &assigned_ip, &state).await {
         log(&state, &format!("✗ Ошибка маршрутов: {}", e));
     }
 
-    // Обновляем статус — теперь реально подключён
     {
         let mut s = state.lock().unwrap();
         s.connection = ConnectionState::Connected {
@@ -287,7 +242,7 @@ pub async fn run(
     });
 
     log(&state, "✓ Туннель активен!");
-    
+
     let abort_tun_to_ws = tun_to_ws.abort_handle();
     let abort_ws_to_tun = ws_to_tun.abort_handle();
     let abort_keepalive = keepalive.abort_handle();
