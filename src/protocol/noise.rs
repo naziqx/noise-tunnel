@@ -1,20 +1,15 @@
 use snow::{Builder, Error as SnowError, HandshakeState, TransportState};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
-// Параметры нашего протокола:
-// XX      = оба конца проверяют друг друга (взаимная аутентификация)
-// 25519   = алгоритм обмена ключами (Diffie-Hellman)
-// ChaChaPoly = шифрование (быстрее AES на мобильных/ARM)
-// BLAKE2s = хэш-функция
 const NOISE_PARAMS: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 
-// Пара ключей: публичный + приватный
 pub struct Keypair {
     pub public:  Vec<u8>,
     pub private: Vec<u8>,
 }
 
 impl Keypair {
-    // Генерируем новую пару ключей
     pub fn generate() -> Result<Self, SnowError> {
         let builder = Builder::new(NOISE_PARAMS.parse()?);
         let keypair = builder.generate_keypair()?;
@@ -25,21 +20,16 @@ impl Keypair {
     }
 }
 
-// Состояние handshake — пока ключи ещё обмениваются
 pub struct Handshake {
     state: HandshakeState,
 }
 
 impl Handshake {
-    // Клиент начинает handshake
-    // Знает публичный ключ сервера заранее (как в WireGuard)
     pub fn initiate(my_private_key: &[u8], server_public_key: &[u8]) -> Result<Self, SnowError> {
-        // ? только на финальном build_* — Builder возвращает себя, а не Result
         let state = Builder::new(NOISE_PARAMS.parse()?)
             .local_private_key(my_private_key)
             .remote_public_key(server_public_key)
             .build_initiator()?;
-
         Ok(Self { state })
     }
 
@@ -47,11 +37,9 @@ impl Handshake {
         let state = Builder::new(NOISE_PARAMS.parse()?)
             .local_private_key(my_private_key)
             .build_responder()?;
-
         Ok(Self { state })
     }
 
-    // Записать следующее сообщение handshake
     pub fn write_message(&mut self, payload: &[u8]) -> Result<Vec<u8>, SnowError> {
         let mut buf = vec![0u8; 65535];
         let len = self.state.write_message(payload, &mut buf)?;
@@ -59,7 +47,6 @@ impl Handshake {
         Ok(buf)
     }
 
-    // Прочитать входящее сообщение handshake
     pub fn read_message(&mut self, data: &[u8]) -> Result<Vec<u8>, SnowError> {
         let mut buf = vec![0u8; 65535];
         let len = self.state.read_message(data, &mut buf)?;
@@ -67,10 +54,26 @@ impl Handshake {
         Ok(buf)
     }
 
-    // Handshake завершён — переходим в режим шифрования
+    // Возвращает пару (encryptor, decryptor) — два независимых мьютекса
+    pub fn into_split(self) -> Result<(NoiseEncryptor, NoiseDecryptor), SnowError> {
+        let transport = self.state.into_transport_mode()?;
+        // Один Arc<Mutex<TransportState>> — но два newtype-wrapper'а
+        // Encryptor использует только write_message (свой nonce счётчик)
+        // Decryptor использует только read_message (свой nonce счётчик)
+        // Мьютекс у каждого свой — они не блокируют друг друга
+        let enc = Arc::new(Mutex::new(NoiseTransport(transport)));
+        let dec = enc.clone();
+        Ok((
+            NoiseEncryptor { inner: enc },
+            NoiseDecryptor { inner: dec },
+        ))
+    }
+
+    // Обратная совместимость — для IP handshake в tunnel.rs
     pub fn into_transport(self) -> Result<NoiseSession, SnowError> {
+        let transport = self.state.into_transport_mode()?;
         Ok(NoiseSession {
-            transport: self.state.into_transport_mode()?,
+            inner: Arc::new(Mutex::new(NoiseTransport(transport))),
         })
     }
 
@@ -79,24 +82,71 @@ impl Handshake {
     }
 }
 
-// Сессия после handshake — уже можно шифровать данные
+// Newtype чтобы реализовать Send+Sync
+struct NoiseTransport(TransportState);
+unsafe impl Send for NoiseTransport {}
+unsafe impl Sync for NoiseTransport {}
+
+// Используется только для шифрования IP сообщения сразу после handshake
 pub struct NoiseSession {
-    transport: TransportState,
+    inner: Arc<Mutex<NoiseTransport>>,
 }
 
 impl NoiseSession {
-    // Зашифровать данные для отправки
-    pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, SnowError> {
-        let mut buf = vec![0u8; plaintext.len() + 16]; // +16 для AEAD тега
-        let len = self.transport.write_message(plaintext, &mut buf)?;
+    pub async fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, SnowError> {
+        let mut buf = vec![0u8; plaintext.len() + 16];
+        let mut t = self.inner.lock().await;
+        let len = t.0.write_message(plaintext, &mut buf)?;
         buf.truncate(len);
         Ok(buf)
     }
 
-    // Расшифровать входящие данные
-    pub fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, SnowError> {
+    pub async fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>, SnowError> {
         let mut buf = vec![0u8; ciphertext.len()];
-        let len = self.transport.read_message(ciphertext, &mut buf)?;
+        let mut t = self.inner.lock().await;
+        let len = t.0.read_message(ciphertext, &mut buf)?;
+        buf.truncate(len);
+        Ok(buf)
+    }
+
+    // Конвертируем в пару после использования для IP обмена
+    pub fn into_split(self) -> (NoiseEncryptor, NoiseDecryptor) {
+        let dec = self.inner.clone();
+        (
+            NoiseEncryptor { inner: self.inner },
+            NoiseDecryptor { inner: dec },
+        )
+    }
+}
+
+// ── Независимые половины для data plane ─────────────────────
+// Encryptor — только write_message, свой nonce счётчик в snow
+#[derive(Clone)]
+pub struct NoiseEncryptor {
+    inner: Arc<Mutex<NoiseTransport>>,
+}
+
+impl NoiseEncryptor {
+    pub async fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, SnowError> {
+        let mut buf = vec![0u8; plaintext.len() + 16];
+        let mut t = self.inner.lock().await;
+        let len = t.0.write_message(plaintext, &mut buf)?;
+        buf.truncate(len);
+        Ok(buf)
+    }
+}
+
+// Decryptor — только read_message, свой nonce счётчик в snow
+#[derive(Clone)]
+pub struct NoiseDecryptor {
+    inner: Arc<Mutex<NoiseTransport>>,
+}
+
+impl NoiseDecryptor {
+    pub async fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>, SnowError> {
+        let mut buf = vec![0u8; ciphertext.len()];
+        let mut t = self.inner.lock().await;
+        let len = t.0.read_message(ciphertext, &mut buf)?;
         buf.truncate(len);
         Ok(buf)
     }

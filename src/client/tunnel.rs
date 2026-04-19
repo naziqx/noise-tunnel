@@ -73,11 +73,7 @@ pub async fn run(
         .unwrap_or("").to_string();
 
     log(&state, &format!("Подключаюсь к {}...", server_url));
-
-    {
-        let mut s = state.lock().unwrap();
-        s.connection = ConnectionState::Connecting;
-    }
+    { state.lock().unwrap().connection = ConnectionState::Connecting; }
 
     let connector = Connector::NativeTls(native_tls::TlsConnector::new()?);
     let (ws, _) = match tokio_tungstenite::connect_async_tls_with_config(
@@ -85,10 +81,8 @@ pub async fn run(
     ).await {
         Ok(r) => r,
         Err(e) => {
-            let msg = format!("✗ Ошибка подключения: {}", e);
-            log(&state, &msg);
-            let mut s = state.lock().unwrap();
-            s.connection = ConnectionState::Error(e.to_string());
+            log(&state, &format!("✗ Ошибка подключения: {}", e));
+            state.lock().unwrap().connection = ConnectionState::Error(e.to_string());
             return Err(e.into());
         }
     };
@@ -103,38 +97,33 @@ pub async fn run(
     ws_tx.send(Message::Binary(msg1.into())).await?;
     log(&state, "→ msg1 отправлен");
 
-    let msg2 = ws_rx.next().await
-        .ok_or(anyhow::anyhow!("соединение закрыто"))??;
+    let msg2 = ws_rx.next().await.ok_or(anyhow::anyhow!("соединение закрыто"))??;
     hs.read_message(&msg2.into_data())?;
     log(&state, "← msg2 получен");
 
     let msg3 = hs.write_message(&[])?;
     ws_tx.send(Message::Binary(msg3.into())).await?;
     log(&state, "→ msg3 отправлен");
-
     log(&state, "✓ Handshake завершён!");
 
-    let session = Arc::new(tokio::sync::Mutex::new(hs.into_transport()?));
+    // ── Получаем IP (используем временную сессию) ────────
+    let session = hs.into_transport()?;
 
-    // ── Получаем назначенный IP от сервера ───────────────
-    let ip_msg = ws_rx.next().await
-        .ok_or(anyhow::anyhow!("сервер не прислал IP"))??;
-
+    let ip_msg = ws_rx.next().await.ok_or(anyhow::anyhow!("сервер не прислал IP"))??;
     let assigned_ip = {
-        let mut sess = session.lock().await;
-        let decrypted = sess.decrypt(&ip_msg.into_data())?;
+        let decrypted = session.decrypt(&ip_msg.into_data()).await?;
         String::from_utf8(decrypted)?
     };
-
     log(&state, &format!("✓ Получен IP: {}", assigned_ip));
-
     std::fs::write("/tmp/vpn.client_ip", &assigned_ip)?;
+
+    // ── Разбиваем сессию на два независимых направления ──
+    let (encryptor, decryptor) = session.into_split();
 
     // ── Создаём TUN ──────────────────────────────────────
     let tun_dev = crate::client::tun::create_tun(&assigned_ip)?;
     log(&state, &format!("✓ TUN создан ({})", assigned_ip));
 
-    // ── Настраиваем маршруты через скрипт ────────────────
     if let Err(e) = setup_routes(&vps_host, &assigned_ip, &state).await {
         log(&state, &format!("✗ Ошибка маршрутов: {}", e));
     }
@@ -150,14 +139,12 @@ pub async fn run(
     let (mut tun_rx, mut tun_tx) = tokio::io::split(tun_dev);
     let ws_tx = Arc::new(tokio::sync::Mutex::new(ws_tx));
 
-    let sess_tun_to_ws = session.clone();
-    let sess_ws_to_tun = session.clone();
-    let sess_ka        = session.clone();
-    let ws_tx_tun      = ws_tx.clone();
-    let ws_tx_ka       = ws_tx.clone();
-    let state_ka       = state.clone();
+    let ws_tx_tun  = ws_tx.clone();
+    let ws_tx_ka   = ws_tx.clone();
+    let enc_ka     = encryptor.clone();
+    let state_ka   = state.clone();
 
-    // ── TUN → WebSocket ──────────────────────────────────
+    // ── TUN → WebSocket (encrypt) ────────────────────────
     let tun_to_ws = tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
         loop {
@@ -170,37 +157,25 @@ pub async fn run(
             let frame   = Frame::new_data(Bytes::copy_from_slice(&buf[..n]));
             let encoded = frame.encode();
 
-            let encrypted = {
-                let mut sess = sess_tun_to_ws.lock().await;
-                match sess.encrypt(&encoded) {
-                    Ok(e) => e,
-                    Err(_) => break,
-                }
-            };
-
-            let mut tx = ws_tx_tun.lock().await;
-            if tx.send(Message::Binary(encrypted.into())).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    // ── WebSocket → TUN ──────────────────────────────────
-    let ws_to_tun = tokio::spawn(async move {
-        while let Some(msg) = ws_rx.next().await {
-            let msg = match msg {
-                Ok(m) => m,
+            let encrypted = match encryptor.encrypt(&encoded).await {
+                Ok(e) => e,
                 Err(_) => break,
             };
 
+            let mut tx = ws_tx_tun.lock().await;
+            if tx.send(Message::Binary(encrypted.into())).await.is_err() { break; }
+        }
+    });
+
+    // ── WebSocket → TUN (decrypt) ────────────────────────
+    let ws_to_tun = tokio::spawn(async move {
+        while let Some(msg) = ws_rx.next().await {
+            let msg = match msg { Ok(m) => m, Err(_) => break };
             if !msg.is_binary() { continue; }
 
-            let decrypted = {
-                let mut sess = sess_ws_to_tun.lock().await;
-                match sess.decrypt(&msg.into_data()) {
-                    Ok(d) => d,
-                    Err(_) => break,
-                }
+            let decrypted = match decryptor.decrypt(&msg.into_data()).await {
+                Ok(d) => d,
+                Err(_) => break,
             };
 
             let frame = match Frame::decode(&decrypted) {
@@ -209,14 +184,12 @@ pub async fn run(
             };
 
             if frame.frame_type == FrameType::Data {
-                if tun_tx.write_all(&frame.payload).await.is_err() {
-                    break;
-                }
+                if tun_tx.write_all(&frame.payload).await.is_err() { break; }
             }
         }
     });
 
-    // ── Keepalive ────────────────────────────────────────
+    // ── Keepalive (encrypt, независимо от TUN→WS) ────────
     let keepalive = tokio::spawn(async move {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(KEEPALIVE_INTERVAL)).await;
@@ -224,18 +197,13 @@ pub async fn run(
             let frame   = Frame::new_keepalive();
             let encoded = frame.encode();
 
-            let encrypted = {
-                let mut sess = sess_ka.lock().await;
-                match sess.encrypt(&encoded) {
-                    Ok(e) => e,
-                    Err(_) => break,
-                }
+            let encrypted = match enc_ka.encrypt(&encoded).await {
+                Ok(e) => e,
+                Err(_) => break,
             };
 
             let mut tx = ws_tx_ka.lock().await;
-            if tx.send(Message::Binary(encrypted.into())).await.is_err() {
-                break;
-            }
+            if tx.send(Message::Binary(encrypted.into())).await.is_err() { break; }
 
             log(&state_ka, "♥ keepalive отправлен");
         }
@@ -248,23 +216,18 @@ pub async fn run(
     let abort_keepalive = keepalive.abort_handle();
 
     tokio::select! {
-        _ = tun_to_ws  => log(&state, "TUN→WS завершена"),
-        _ = ws_to_tun  => log(&state, "WS→TUN завершена"),
-        _ = keepalive  => log(&state, "keepalive завершён"),
+        _ = tun_to_ws    => log(&state, "TUN→WS завершена"),
+        _ = ws_to_tun    => log(&state, "WS→TUN завершена"),
+        _ = keepalive    => log(&state, "keepalive завершён"),
         _ = &mut stop_rx => log(&state, "Получен сигнал остановки"),
     }
     abort_tun_to_ws.abort();
     abort_ws_to_tun.abort();
     abort_keepalive.abort();
 
-    // ── Чистка ───────────────────────────────────────────
     restore_routes(&state).await;
     std::fs::remove_file("/tmp/vpn.client_ip").ok();
-
-    {
-        let mut s = state.lock().unwrap();
-        s.connection = ConnectionState::Disconnected;
-    }
+    { state.lock().unwrap().connection = ConnectionState::Disconnected; }
     log(&state, "✓ Отключено");
 
     Ok(())
