@@ -155,10 +155,37 @@ async fn handle_client(
         .args(["route", "add", &client_ip, "dev", &tun_name])
         .output().await.ok();
 
+    // Определяем внешний интерфейс для NAT
+    let iface = {
+        let out = tokio::process::Command::new("ip")
+            .args(["route", "show", "default"])
+            .output().await
+            .ok();
+        let stdout = out.as_ref().map(|o| o.stdout.as_slice()).unwrap_or(&[]);
+        let s = String::from_utf8_lossy(stdout);
+        s.split_whitespace()
+            .skip_while(|&w| w != "dev")
+            .nth(1)
+            .unwrap_or("eth0")
+            .to_string()
+    };
+
+    // NAT: форвардим трафик клиента в интернет через внешний интерфейс
     tokio::process::Command::new("iptables")
         .args(["-t", "nat", "-A", "POSTROUTING",
-               "-s", &client_ip, "-j", "MASQUERADE"])
+               "-s", &client_ip, "-o", &iface, "-j", "MASQUERADE"])
         .output().await.ok();
+
+    // FORWARD: разрешаем трафик через tun этого клиента
+    tokio::process::Command::new("iptables")
+        .args(["-A", "FORWARD", "-i", &tun_name, "-j", "ACCEPT"])
+        .output().await.ok();
+
+    tokio::process::Command::new("iptables")
+        .args(["-A", "FORWARD", "-o", &tun_name, "-j", "ACCEPT"])
+        .output().await.ok();
+
+    println!("[сервер] iptables настроен для {} через {}", tun_name, iface);
 
     let (mut tun_rx, mut tun_tx) = tokio::io::split(tun_dev);
     let ws_tx = Arc::new(Mutex::new(ws_tx));
@@ -278,7 +305,15 @@ async fn handle_client(
 
     tokio::process::Command::new("iptables")
         .args(["-t", "nat", "-D", "POSTROUTING",
-               "-s", &client_ip, "-j", "MASQUERADE"])
+               "-s", &client_ip, "-o", &iface, "-j", "MASQUERADE"])
+        .output().await.ok();
+
+    tokio::process::Command::new("iptables")
+        .args(["-D", "FORWARD", "-i", &tun_name, "-j", "ACCEPT"])
+        .output().await.ok();
+
+    tokio::process::Command::new("iptables")
+        .args(["-D", "FORWARD", "-o", &tun_name, "-j", "ACCEPT"])
         .output().await.ok();
 
     // Удаляем TUN интерфейс

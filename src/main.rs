@@ -26,7 +26,7 @@ enum Commands {
     /// Запустить клиент с TUI интерфейсом
     Tui {
         /// URL сервера (можно задать в TUI)
-        #[arg(long, default_value = "wss://noise-tunnel.ddns.net:2443")]
+        #[arg(long, default_value = "wss://noise-tunnel.ddns.net:443")]
         url: String,
 
         /// Публичный ключ сервера (можно задать в TUI)
@@ -67,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
                 keys
             };
 
-            server::listener::run("0.0.0.0:2443", keys).await?;
+            server::listener::run("0.0.0.0:443", keys).await?;
         }
 
         // ── Клиент без TUI ───────────────────────────────
@@ -84,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
 
             let state = std::sync::Arc::new(std::sync::Mutex::new(
                 client::tui::AppState::new(
-                    "wss://noise-tunnel.ddns.net:2443".to_string(),
+                    "wss://noise-tunnel.ddns.net:443".to_string(),
                     server_key,
                 )
             ));
@@ -92,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
             let (_stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
 
             client::tunnel::run(
-                "wss://noise-tunnel.ddns.net:2443",
+                "wss://noise-tunnel.ddns.net:443",
                 my_keys,
                 server_public,
                 state,
